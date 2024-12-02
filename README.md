@@ -4,9 +4,7 @@ Simple but reliable PHP script to safely sync WordPress databases between enviro
 
 ## TL;DR
 ```bash
-# Setup
-cp config.example.php config.php
-# Edit config.php with your database credentials
+Edit config.php with your database credentials
 chmod +x wp-sync.php
 
 # Usage
