@@ -5,6 +5,7 @@
  * 
  * This script safely synchronizes WordPress databases between environments
  * with proper error handling and logging.
+ * Validates current path and detects correct database for each domain
  * 
  * Usage: ./wp-sync.php [direction]
  * where direction is either 'prod_to_dev' or 'dev_to_prod'
@@ -14,56 +15,163 @@
  */
 
 class WordPressDatabaseSync {
-    /** @var array Configuration for different environments */
     private $config;
-    
-    /** @var string Path to log file */
     private $logFile;
+    private $wpConfig;
     
-    /** @var array Tables to exclude from sync */
     private $excludedTables = [
         'wp_users',
         'wp_usermeta'
     ];
 
-    /**
-     * Constructor
-     * 
-     * @throws Exception if config file is missing or invalid
-     */
     public function __construct() {
         $this->logFile = dirname(__FILE__) . '/sync_log.txt';
+        $this->detectCurrentSetup();
         $this->loadConfig();
         $this->validateEnvironment();
     }
 
     /**
-     * Loads configuration from config file
-     * 
-     * @throws Exception if config file is missing or invalid
+     * Detects current WordPress setup from path
+     * @throws Exception if WordPress is not detected
+     */
+    private function detectCurrentSetup() {
+        // Get current directory path
+        $currentPath = getcwd();
+        
+        // Find wp-config.php by traversing up
+        $configPath = $this->findWPConfig($currentPath);
+        if (!$configPath) {
+            throw new Exception("No WordPress installation detected in current path: {$currentPath}");
+        }
+
+        // Parse wp-config.php to get database details
+        $this->wpConfig = $this->parseWPConfig($configPath);
+        
+        $this->log("Detected WordPress installation:");
+        $this->log("Database: {$this->wpConfig['DB_NAME']}");
+    }
+
+    /**
+     * Finds WordPress config file
+     * @param string $startPath Path to start searching from
+     * @return string|false Path to wp-config.php or false if not found
+     */
+    private function findWPConfig($startPath) {
+        $configFile = 'wp-config.php';
+        $currentPath = $startPath;
+        
+        while ($currentPath !== '/') {
+            if (file_exists($currentPath . '/' . $configFile)) {
+                return $currentPath . '/' . $configFile;
+            }
+            $currentPath = dirname($currentPath);
+        }
+        
+        return false;
+    }
+
+    /**
+     * Parses WordPress config file
+     * @param string $configPath Path to wp-config.php
+     * @return array WordPress configuration values
+     */
+    private function parseWPConfig($configPath) {
+        $configContent = file_get_contents($configPath);
+        
+        $configs = [
+            'DB_NAME' => null,
+            'DB_USER' => null,
+            'DB_PASSWORD' => null,
+            'DB_HOST' => null,
+            'table_prefix' => 'wp_'
+        ];
+
+        foreach ($configs as $key => &$value) {
+            if (preg_match("/define\(\s*['\"]" . $key . "['\"]\s*,\s*['\"](.*?)['\"]\s*\)/", $configContent, $matches)) {
+                $value = $matches[1];
+            } else if ($key === 'table_prefix') {
+                if (preg_match("/\\\$table_prefix\s*=\s*['\"](.*?)['\"]\s*;/", $configContent, $matches)) {
+                    $value = $matches[1];
+                }
+            }
+        }
+
+        if (in_array(null, $configs, true)) {
+            throw new Exception("Could not parse all required values from wp-config.php");
+        }
+
+        return $configs;
+    }
+
+    /**
+     * Loads and validates configuration
      */
     private function loadConfig() {
         $configFile = dirname(__FILE__) . '/config.php';
         
         if (!file_exists($configFile)) {
-            throw new Exception('Config file not found. Please create config.php');
+            // Create default config if it doesn't exist
+            $this->createDefaultConfig($configFile);
+            throw new Exception("Default config file created at {$configFile}. Please edit it with your settings.");
         }
 
         $this->config = require $configFile;
         
-        // Validate config structure
-        $requiredKeys = ['production', 'development'];
-        $requiredSubKeys = ['db_host', 'db_name', 'db_user', 'db_pass', 'site_url'];
-        
-        foreach ($requiredKeys as $key) {
-            if (!isset($this->config[$key])) {
-                throw new Exception("Missing required config key: {$key}");
+        // Development environment uses local WordPress config
+        $this->config['development'] = array_merge($this->config['development'] ?? [], [
+            'db_host' => $this->wpConfig['DB_HOST'],
+            'db_name' => $this->wpConfig['DB_NAME'],
+            'db_user' => $this->wpConfig['DB_USER'],
+            'db_pass' => $this->wpConfig['DB_PASSWORD'],
+            'table_prefix' => $this->wpConfig['table_prefix']
+        ]);
+
+        $this->validateConfig();
+    }
+
+    /**
+     * Creates default configuration file
+     */
+    private function createDefaultConfig($configFile) {
+        $defaultConfig = <<<PHP
+<?php
+return [
+    'production' => [
+        'ssh_host' => 'your-production-server.com',
+        'ssh_user' => 'production-username',
+        'ssh_port' => 22,
+        'db_host' => 'localhost',
+        'db_name' => 'production_wordpress',
+        'db_user' => 'production_db_user',
+        'db_pass' => 'production_db_pass',
+        'site_url' => 'https://www.example.com',
+        'table_prefix' => 'wp_',
+        'wp_path' => '/home/user/public_html/domain.com'
+    ],
+    'development' => [
+        'site_url' => 'https://dev.example.com'
+    ]
+];
+PHP;
+        file_put_contents($configFile, $defaultConfig);
+    }
+
+    /**
+     * Validates configuration
+     */
+    private function validateConfig() {
+        // Validate production config
+        $requiredProdKeys = ['ssh_host', 'ssh_user', 'ssh_port', 'db_host', 'db_name', 'db_user', 'db_pass', 'site_url', 'wp_path'];
+        foreach ($requiredProdKeys as $key) {
+            if (!isset($this->config['production'][$key])) {
+                throw new Exception("Missing required production config key: {$key}");
             }
-            foreach ($requiredSubKeys as $subKey) {
-                if (!isset($this->config[$key][$subKey])) {
-                    throw new Exception("Missing required config subkey: {$key}.{$subKey}");
-                }
-            }
+        }
+
+        // Development config is auto-detected from local WordPress
+        if (!isset($this->config['development']['site_url'])) {
+            throw new Exception("Missing development site URL in config");
         }
     }
 
@@ -73,7 +181,7 @@ class WordPressDatabaseSync {
      * @throws Exception if required commands are not available
      */
     private function validateEnvironment() {
-        $requiredCommands = ['mysql', 'mysqldump'];
+        $requiredCommands = ['mysql', 'mysqldump', 'ssh'];
         foreach ($requiredCommands as $command) {
             exec("which {$command}", $output, $returnVar);
             if ($returnVar !== 0) {
@@ -111,10 +219,7 @@ class WordPressDatabaseSync {
             // Perform sync
             $this->exportDatabase($source);
             $this->importDatabase($target);
-            $this->updateUrls(
-                $this->config[$source]['site_url'],
-                $this->config[$target]['site_url']
-            );
+            $this->updateRemoteUrls($target, $source);
 
             // Cleanup
             $this->cleanup();
@@ -170,14 +275,32 @@ class WordPressDatabaseSync {
                             "." . $table;
         }
 
-        $cmd = sprintf(
-            'mysqldump --opt --single-transaction -h %s -u %s -p%s %s %s > temp_dump.sql',
-            escapeshellarg($this->config[$environment]['db_host']),
-            escapeshellarg($this->config[$environment]['db_user']),
-            escapeshellarg($this->config[$environment]['db_pass']),
-            escapeshellarg($this->config[$environment]['db_name']),
-            $excludeTables
-        );
+        if ($environment === 'production') {
+            // For production, use SSH to run mysqldump
+            $sshCmd = sprintf(
+                'ssh -p %d %s@%s mysqldump --opt --single-transaction -h %s -u %s -p%s %s %s',
+                $this->config['production']['ssh_port'],
+                escapeshellarg($this->config['production']['ssh_user']),
+                escapeshellarg($this->config['production']['ssh_host']),
+                escapeshellarg($this->config['production']['db_host']),
+                escapeshellarg($this->config['production']['db_user']),
+                escapeshellarg($this->config['production']['db_pass']),
+                escapeshellarg($this->config['production']['db_name']),
+                $excludeTables
+            );
+            
+            $cmd = $sshCmd . ' > temp_dump.sql';
+        } else {
+            // For development, use local mysqldump
+            $cmd = sprintf(
+                'mysqldump --opt --single-transaction -h %s -u %s -p%s %s %s > temp_dump.sql',
+                escapeshellarg($this->config[$environment]['db_host']),
+                escapeshellarg($this->config[$environment]['db_user']),
+                escapeshellarg($this->config[$environment]['db_pass']),
+                escapeshellarg($this->config[$environment]['db_name']),
+                $excludeTables
+            );
+        }
 
         exec($cmd . ' 2>&1', $output, $returnVar);
         
@@ -209,35 +332,28 @@ class WordPressDatabaseSync {
     }
 
     /**
-     * Updates URLs in the database
+     * Updates URLs in the remote database
      * 
-     * @param string $oldUrl Source URL
-     * @param string $newUrl Target URL
+     * @param string $environment Target environment
+     * @param string $sourceEnv Source environment
      * @throws Exception on update failure
      */
-    private function updateUrls($oldUrl, $newUrl) {
+    private function updateRemoteUrls($environment, $sourceEnv) {
+        // Use detected table prefix
+        $prefix = $this->config[$environment]['table_prefix'];
+        
         $queries = [
-            // Update WordPress core URLs
-            "UPDATE wp_options SET option_value = replace(option_value, %s, %s) 
-             WHERE option_name = 'home' OR option_name = 'siteurl';",
-            
-            // Update content URLs
-            "UPDATE wp_posts SET post_content = replace(post_content, %s, %s);",
-            
-            // Update meta values
-            "UPDATE wp_postmeta SET meta_value = replace(meta_value, %s, %s) 
-             WHERE meta_value LIKE %s;",
-            
-            // Update serialized data
-            "UPDATE wp_options SET option_value = replace(option_value, %s, %s) 
-             WHERE option_value LIKE %s;"
+            "UPDATE {$prefix}options SET option_value = replace(option_value, '%s', '%s') WHERE option_name = 'home' OR option_name = 'siteurl';",
+            "UPDATE {$prefix}posts SET post_content = replace(post_content, '%s', '%s');",
+            "UPDATE {$prefix}postmeta SET meta_value = replace(meta_value, '%s', '%s') WHERE meta_value LIKE '%%%s%%';",
+            "UPDATE {$prefix}options SET option_value = replace(option_value, '%s', '%s') WHERE option_value LIKE '%%%s%%';"
         ];
 
         $mysqli = new mysqli(
-            $this->config['development']['db_host'],
-            $this->config['development']['db_user'],
-            $this->config['development']['db_pass'],
-            $this->config['development']['db_name']
+            $this->config[$environment]['db_host'],
+            $this->config[$environment]['db_user'],
+            $this->config[$environment]['db_pass'],
+            $this->config[$environment]['db_name']
         );
 
         if ($mysqli->connect_error) {
@@ -250,8 +366,8 @@ class WordPressDatabaseSync {
                 throw new Exception("Query preparation failed: " . $mysqli->error);
             }
 
-            $oldUrlLike = '%' . $oldUrl . '%';
-            $stmt->bind_param('sss', $oldUrl, $newUrl, $oldUrlLike);
+            $oldUrlLike = '%' . $this->config[$sourceEnv]['site_url'] . '%';
+            $stmt->bind_param('sss', $this->config[$sourceEnv]['site_url'], $this->config[$environment]['site_url'], $oldUrlLike);
             
             if (!$stmt->execute()) {
                 throw new Exception("Query execution failed: " . $stmt->error);
@@ -303,6 +419,7 @@ class WordPressDatabaseSync {
         $timestamp = date('Y-m-d H:i:s');
         $logMessage = "[{$timestamp}] {$message}\n";
         file_put_contents($this->logFile, $logMessage, FILE_APPEND);
+        echo $logMessage;
     }
 }
 
