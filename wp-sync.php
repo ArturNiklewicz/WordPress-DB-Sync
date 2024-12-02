@@ -9,7 +9,7 @@
  * Usage: ./wp-sync.php [direction]
  * where direction is either 'prod_to_dev' or 'dev_to_prod'
  * 
- * @author Your Name
+ * @author Artur Niklewicz
  * @version 1.0.0
  */
 
