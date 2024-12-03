@@ -8,7 +8,7 @@
  * Validates current path and detects correct database for each domain
  * 
  * Usage: ./wp-sync.php [direction]
- * where direction is either 'prod_to_dev' or 'dev_to_prod'
+ * where direction is either 'prod_to_dev', 'dev_to_prod', 'prod_to_stage', 'stage_to_dev', 'stage_to_prod', or 'dev_to_stage'
  * 
  * @author Artur Niklewicz
  * @version 1.0.0
@@ -149,6 +149,18 @@ return [
         'table_prefix' => 'wp_',
         'wp_path' => '/home/user/public_html/domain.com'
     ],
+    'staging' => [
+        'ssh_host' => 'your-staging-server.com',
+        'ssh_user' => 'staging-username',
+        'ssh_port' => 22,
+        'db_host' => 'localhost',
+        'db_name' => 'staging_wordpress',
+        'db_user' => 'staging_db_user',
+        'db_pass' => 'staging_db_pass',
+        'site_url' => 'https://staging.example.com',
+        'table_prefix' => 'wp_',
+        'wp_path' => '/home/user/public_html/staging.domain.com'
+    ],
     'development' => [
         'site_url' => 'https://dev.example.com'
     ]
@@ -166,6 +178,14 @@ PHP;
         foreach ($requiredProdKeys as $key) {
             if (!isset($this->config['production'][$key])) {
                 throw new Exception("Missing required production config key: {$key}");
+            }
+        }
+
+        // Validate staging config
+        $requiredStageKeys = ['ssh_host', 'ssh_user', 'ssh_port', 'db_host', 'db_name', 'db_user', 'db_pass', 'site_url', 'wp_path'];
+        foreach ($requiredStageKeys as $key) {
+            if (!isset($this->config['staging'][$key])) {
+                throw new Exception("Missing required staging config key: {$key}");
             }
         }
 
@@ -193,44 +213,66 @@ PHP;
     /**
      * Main sync method
      * 
-     * @param string $direction Either 'prod_to_dev' or 'dev_to_prod'
+     * @param string $direction Format: 'source_to_target' (e.g., 'prod_to_dev', 'stage_to_dev', 'prod_to_stage')
      * @throws Exception on sync failure
      */
     public function sync($direction = 'prod_to_dev') {
         $this->log("Starting sync: {$direction}");
-        
         try {
-            // Validate direction
-            if (!in_array($direction, ['prod_to_dev', 'dev_to_prod'])) {
-                throw new Exception('Invalid sync direction');
+            // Parse direction
+            $parts = explode('_to_', $direction);
+            if (count($parts) !== 2) {
+                throw new Exception("Invalid direction format. Use: source_to_target (e.g., prod_to_dev, stage_to_dev)");
             }
-
-            $source = ($direction === 'prod_to_dev') ? 'production' : 'development';
-            $target = ($direction === 'prod_to_dev') ? 'development' : 'production';
-
+            
+            $sourceEnv = $this->getEnvironmentKey($parts[0]);
+            $targetEnv = $this->getEnvironmentKey($parts[1]);
+            
             // Confirm if syncing to production
-            if ($direction === 'dev_to_prod') {
+            if ($targetEnv === 'production') {
                 $this->confirmProductionSync();
             }
-
-            // Create backup
-            $this->createBackup($target);
-
-            // Perform sync
-            $this->exportDatabase($source);
-            $this->importDatabase($target);
-            $this->updateRemoteUrls($target, $source);
-
-            // Cleanup
+            
+            // Create backup of target database
+            $this->createBackup($targetEnv);
+            
+            // Export from source and import to target
+            $this->exportDatabase($sourceEnv);
+            $this->importDatabase($targetEnv);
+            
+            // Update URLs in target database
+            $this->updateRemoteUrls($targetEnv, $sourceEnv);
+            
+            // Cleanup temporary files
             $this->cleanup();
             
             $this->log("Sync completed successfully");
-            
         } catch (Exception $e) {
             $this->log("Error during sync: " . $e->getMessage());
             $this->cleanup();
             throw $e;
         }
+    }
+    
+    /**
+     * Convert environment shorthand to full key
+     * 
+     * @param string $env Environment shorthand (prod/stage/dev)
+     * @return string Full environment key
+     * @throws Exception if invalid environment
+     */
+    private function getEnvironmentKey($env) {
+        $envMap = [
+            'prod' => 'production',
+            'stage' => 'staging',
+            'dev' => 'development'
+        ];
+        
+        if (!isset($envMap[$env])) {
+            throw new Exception("Invalid environment: {$env}. Use: prod, stage, or dev");
+        }
+        
+        return $envMap[$env];
     }
 
     /**
@@ -286,6 +328,21 @@ PHP;
                 escapeshellarg($this->config['production']['db_user']),
                 escapeshellarg($this->config['production']['db_pass']),
                 escapeshellarg($this->config['production']['db_name']),
+                $excludeTables
+            );
+            
+            $cmd = $sshCmd . ' > temp_dump.sql';
+        } elseif ($environment === 'staging') {
+            // For staging, use SSH to run mysqldump
+            $sshCmd = sprintf(
+                'ssh -p %d %s@%s mysqldump --opt --single-transaction -h %s -u %s -p%s %s %s',
+                $this->config['staging']['ssh_port'],
+                escapeshellarg($this->config['staging']['ssh_user']),
+                escapeshellarg($this->config['staging']['ssh_host']),
+                escapeshellarg($this->config['staging']['db_host']),
+                escapeshellarg($this->config['staging']['db_user']),
+                escapeshellarg($this->config['staging']['db_pass']),
+                escapeshellarg($this->config['staging']['db_name']),
                 $excludeTables
             );
             
