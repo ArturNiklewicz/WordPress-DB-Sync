@@ -1,5 +1,7 @@
 # WordPress Database Sync Tool
-[Uploading wp-sync-flowchart TD
+
+```mermaid
+flowchart TD
     A[Start Sync Process] --> B{Check Current Directory}
     B -->|Not Found| C[Throw Exception:<br/>No WordPress Installation]
     B -->|Found| D[Detect WordPress Setup]
@@ -42,7 +44,7 @@
         BB[Detailed Error Logging]
         CC[Cleanup on Failure]
     end
-flowchart.mermaid…]()
+```
 
 Simple but reliable PHP script to safely sync WordPress databases between environments with proper error handling, logging, and backups.
 
