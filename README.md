@@ -1,5 +1,17 @@
 # WordPress Database Sync Tool
+Simple but reliable PHP script to safely sync WordPress databases between environments with proper error handling, logging, and backups.
 
+## TL;DR
+```bash
+Edit config.php with your database credentials
+chmod +x wp-sync.php
+
+# Usage
+./wp-sync.php prod_to_dev  # Sync production to development
+./wp-sync.php dev_to_prod  # Sync development to production
+```
+
+## Flowchart
 ```mermaid
 flowchart TD
     A[Start Sync Process] --> B{Check Current Directory}
@@ -44,18 +56,6 @@ flowchart TD
         BB[Detailed Error Logging]
         CC[Cleanup on Failure]
     end
-```
-
-Simple but reliable PHP script to safely sync WordPress databases between environments with proper error handling, logging, and backups.
-
-## TL;DR
-```bash
-Edit config.php with your database credentials
-chmod +x wp-sync.php
-
-# Usage
-./wp-sync.php prod_to_dev  # Sync production to development
-./wp-sync.php dev_to_prod  # Sync development to production
 ```
 
 ## Features
