@@ -111,12 +111,15 @@ class WordPressDatabaseSync {
         $configFile = dirname(__FILE__) . '/config.php';
         
         if (!file_exists($configFile)) {
-            // Create default config if it doesn't exist
             $this->createDefaultConfig($configFile);
             throw new Exception("Default config file created at {$configFile}. Please edit it with your settings.");
         }
 
         $this->config = require $configFile;
+        
+        // Auto-detect database credentials for production and staging
+        $this->detectRemoteCredentials('production');
+        $this->detectRemoteCredentials('staging');
         
         // Development environment uses local WordPress config
         $this->config['development'] = array_merge($this->config['development'] ?? [], [
@@ -317,47 +320,17 @@ PHP;
                             "." . $table;
         }
 
-        if ($environment === 'production') {
-            // For production, use SSH to run mysqldump
-            $sshCmd = sprintf(
-                'ssh -p %d %s@%s mysqldump --opt --single-transaction -h %s -u %s -p%s %s %s',
-                $this->config['production']['ssh_port'],
-                escapeshellarg($this->config['production']['ssh_user']),
-                escapeshellarg($this->config['production']['ssh_host']),
-                escapeshellarg($this->config['production']['db_host']),
-                escapeshellarg($this->config['production']['db_user']),
-                escapeshellarg($this->config['production']['db_pass']),
-                escapeshellarg($this->config['production']['db_name']),
-                $excludeTables
-            );
-            
-            $cmd = $sshCmd . ' > temp_dump.sql';
-        } elseif ($environment === 'staging') {
-            // For staging, use SSH to run mysqldump
-            $sshCmd = sprintf(
-                'ssh -p %d %s@%s mysqldump --opt --single-transaction -h %s -u %s -p%s %s %s',
-                $this->config['staging']['ssh_port'],
-                escapeshellarg($this->config['staging']['ssh_user']),
-                escapeshellarg($this->config['staging']['ssh_host']),
-                escapeshellarg($this->config['staging']['db_host']),
-                escapeshellarg($this->config['staging']['db_user']),
-                escapeshellarg($this->config['staging']['db_pass']),
-                escapeshellarg($this->config['staging']['db_name']),
-                $excludeTables
-            );
-            
-            $cmd = $sshCmd . ' > temp_dump.sql';
-        } else {
-            // For development, use local mysqldump
-            $cmd = sprintf(
-                'mysqldump --opt --single-transaction -h %s -u %s -p%s %s %s > temp_dump.sql',
-                escapeshellarg($this->config[$environment]['db_host']),
-                escapeshellarg($this->config[$environment]['db_user']),
-                escapeshellarg($this->config[$environment]['db_pass']),
-                escapeshellarg($this->config[$environment]['db_name']),
-                $excludeTables
-            );
-        }
+        $cmd = sprintf(
+            'ssh -p %d %s@%s "mysqldump --opt --single-transaction -h %s -u %s -p%s %s %s" > temp_dump.sql',
+            $this->config[$environment]['ssh_port'],
+            escapeshellarg($this->config[$environment]['ssh_user']),
+            escapeshellarg($this->config[$environment]['ssh_host']),
+            escapeshellarg($this->config[$environment]['db_host']),
+            escapeshellarg($this->config[$environment]['db_user']),
+            escapeshellarg($this->config[$environment]['db_pass']),
+            escapeshellarg($this->config[$environment]['db_name']),
+            $excludeTables
+        );
 
         exec($cmd . ' 2>&1', $output, $returnVar);
         
@@ -374,7 +347,10 @@ PHP;
      */
     private function importDatabase($environment) {
         $cmd = sprintf(
-            'mysql -h %s -u %s -p%s %s < temp_dump.sql',
+            'ssh -p %d %s@%s "mysql -h %s -u %s -p%s %s" < temp_dump.sql',
+            $this->config[$environment]['ssh_port'],
+            escapeshellarg($this->config[$environment]['ssh_user']),
+            escapeshellarg($this->config[$environment]['ssh_host']),
             escapeshellarg($this->config[$environment]['db_host']),
             escapeshellarg($this->config[$environment]['db_user']),
             escapeshellarg($this->config[$environment]['db_pass']),
@@ -477,6 +453,36 @@ PHP;
         $logMessage = "[{$timestamp}] {$message}\n";
         file_put_contents($this->logFile, $logMessage, FILE_APPEND);
         echo $logMessage;
+    }
+
+    /**
+     * Detects database credentials from remote wp-config.php
+     * @param string $environment The environment to detect credentials for
+     */
+    private function detectRemoteCredentials($environment) {
+        $sshCmd = sprintf(
+            'ssh -p %d %s@%s "php -r \\"include(\'%s/wp-config.php\'); echo json_encode([\'DB_HOST\' => DB_HOST, \'DB_NAME\' => DB_NAME, \'DB_USER\' => DB_USER, \'DB_PASSWORD\' => DB_PASSWORD]);\\"" 2>/dev/null',
+            $this->config[$environment]['ssh_port'],
+            escapeshellarg($this->config[$environment]['ssh_user']),
+            escapeshellarg($this->config[$environment]['ssh_host']),
+            escapeshellarg($this->config[$environment]['wp_path'])
+        );
+        
+        exec($sshCmd, $output, $returnVar);
+        
+        if ($returnVar !== 0) {
+            throw new Exception("Failed to detect remote credentials for {$environment}. Ensure SSH key-based authentication is set up.");
+        }
+        
+        $credentials = json_decode($output[0], true);
+        if (!$credentials) {
+            throw new Exception("Failed to parse remote credentials for {$environment}");
+        }
+        
+        $this->config[$environment]['db_host'] = $credentials['DB_HOST'];
+        $this->config[$environment]['db_name'] = $credentials['DB_NAME'];
+        $this->config[$environment]['db_user'] = $credentials['DB_USER'];
+        $this->config[$environment]['db_pass'] = $credentials['DB_PASSWORD'];
     }
 }
 
