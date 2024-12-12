@@ -1,4 +1,4 @@
-#!/usr/bin/php
+#!/opt/homebrew/opt/php@7.4/bin/php
 <?php
 /**
  * WordPress Database Sync Tool
@@ -17,7 +17,8 @@
 class WordPressDatabaseSync {
     private $config;
     private $logFile;
-    private $wpConfig;
+    private $lastSyncFile;
+    private $minSyncInterval = 300; // 5 minutes between syncs
     
     private $excludedTables = [
         'wp_users',
@@ -26,82 +27,11 @@ class WordPressDatabaseSync {
 
     public function __construct() {
         $this->logFile = dirname(__FILE__) . '/sync_log.txt';
-        $this->detectCurrentSetup();
+        $this->lastSyncFile = dirname(__FILE__) . '/.last_sync';
         $this->loadConfig();
         $this->validateEnvironment();
-    }
-
-    /**
-     * Detects current WordPress setup from path
-     * @throws Exception if WordPress is not detected
-     */
-    private function detectCurrentSetup() {
-        // Get current directory path
-        $currentPath = getcwd();
-        
-        // Find wp-config.php by traversing up
-        $configPath = $this->findWPConfig($currentPath);
-        if (!$configPath) {
-            throw new Exception("No WordPress installation detected in current path: {$currentPath}");
-        }
-
-        // Parse wp-config.php to get database details
-        $this->wpConfig = $this->parseWPConfig($configPath);
-        
-        $this->log("Detected WordPress installation:");
-        $this->log("Database: {$this->wpConfig['DB_NAME']}");
-    }
-
-    /**
-     * Finds WordPress config file
-     * @param string $startPath Path to start searching from
-     * @return string|false Path to wp-config.php or false if not found
-     */
-    private function findWPConfig($startPath) {
-        $configFile = 'wp-config.php';
-        $currentPath = $startPath;
-        
-        while ($currentPath !== '/') {
-            if (file_exists($currentPath . '/' . $configFile)) {
-                return $currentPath . '/' . $configFile;
-            }
-            $currentPath = dirname($currentPath);
-        }
-        
-        return false;
-    }
-
-    /**
-     * Parses WordPress config file
-     * @param string $configPath Path to wp-config.php
-     * @return array WordPress configuration values
-     */
-    private function parseWPConfig($configPath) {
-        $configContent = file_get_contents($configPath);
-        
-        $configs = [
-            'DB_NAME' => null,
-            'DB_USER' => null,
-            'DB_PASSWORD' => null,
-            'DB_HOST' => null,
-            'table_prefix' => 'wp_'
-        ];
-
-        foreach ($configs as $key => &$value) {
-            if (preg_match("/define\(\s*['\"]" . $key . "['\"]\s*,\s*['\"](.*?)['\"]\s*\)/", $configContent, $matches)) {
-                $value = $matches[1];
-            } else if ($key === 'table_prefix') {
-                if (preg_match("/\\\$table_prefix\s*=\s*['\"](.*?)['\"]\s*;/", $configContent, $matches)) {
-                    $value = $matches[1];
-                }
-            }
-        }
-
-        if (in_array(null, $configs, true)) {
-            throw new Exception("Could not parse all required values from wp-config.php");
-        }
-
-        return $configs;
+        $this->validateFilePermissions();
+        $this->checkRateLimit();
     }
 
     /**
@@ -109,67 +39,9 @@ class WordPressDatabaseSync {
      */
     private function loadConfig() {
         $configFile = dirname(__FILE__) . '/config.php';
-        
-        if (!file_exists($configFile)) {
-            $this->createDefaultConfig($configFile);
-            throw new Exception("Default config file created at {$configFile}. Please edit it with your settings.");
-        }
 
         $this->config = require $configFile;
-        
-        // Auto-detect database credentials for production and staging
-        $this->detectRemoteCredentials('production');
-        $this->detectRemoteCredentials('staging');
-        
-        // Development environment uses local WordPress config
-        $this->config['development'] = array_merge($this->config['development'] ?? [], [
-            'db_host' => $this->wpConfig['DB_HOST'],
-            'db_name' => $this->wpConfig['DB_NAME'],
-            'db_user' => $this->wpConfig['DB_USER'],
-            'db_pass' => $this->wpConfig['DB_PASSWORD'],
-            'table_prefix' => $this->wpConfig['table_prefix']
-        ]);
-
         $this->validateConfig();
-    }
-
-    /**
-     * Creates default configuration file
-     */
-    private function createDefaultConfig($configFile) {
-        $defaultConfig = <<<PHP
-<?php
-return [
-    'production' => [
-        'ssh_host' => 'your-production-server.com',
-        'ssh_user' => 'production-username',
-        'ssh_port' => 22,
-        'db_host' => 'localhost',
-        'db_name' => 'production_wordpress',
-        'db_user' => 'production_db_user',
-        'db_pass' => 'production_db_pass',
-        'site_url' => 'https://www.example.com',
-        'table_prefix' => 'wp_',
-        'wp_path' => '/home/user/public_html/domain.com'
-    ],
-    'staging' => [
-        'ssh_host' => 'your-staging-server.com',
-        'ssh_user' => 'staging-username',
-        'ssh_port' => 22,
-        'db_host' => 'localhost',
-        'db_name' => 'staging_wordpress',
-        'db_user' => 'staging_db_user',
-        'db_pass' => 'staging_db_pass',
-        'site_url' => 'https://staging.example.com',
-        'table_prefix' => 'wp_',
-        'wp_path' => '/home/user/public_html/staging.domain.com'
-    ],
-    'development' => [
-        'site_url' => 'https://dev.example.com'
-    ]
-];
-PHP;
-        file_put_contents($configFile, $defaultConfig);
     }
 
     /**
@@ -178,23 +50,13 @@ PHP;
     private function validateConfig() {
         // Validate production config
         $requiredProdKeys = ['ssh_host', 'ssh_user', 'ssh_port', 'db_host', 'db_name', 'db_user', 'db_pass', 'site_url', 'wp_path'];
+        $stages = ['production','staging', 'development'];
         foreach ($requiredProdKeys as $key) {
-            if (!isset($this->config['production'][$key])) {
-                throw new Exception("Missing required production config key: {$key}");
+            foreach ($stages as $stage) {   
+                if (!isset($this->config[$stage][$key])) {
+                    throw new Exception("Missing required {$stage} config key: {$key}");
+                }
             }
-        }
-
-        // Validate staging config
-        $requiredStageKeys = ['ssh_host', 'ssh_user', 'ssh_port', 'db_host', 'db_name', 'db_user', 'db_pass', 'site_url', 'wp_path'];
-        foreach ($requiredStageKeys as $key) {
-            if (!isset($this->config['staging'][$key])) {
-                throw new Exception("Missing required staging config key: {$key}");
-            }
-        }
-
-        // Development config is auto-detected from local WordPress
-        if (!isset($this->config['development']['site_url'])) {
-            throw new Exception("Missing development site URL in config");
         }
     }
 
@@ -214,6 +76,65 @@ PHP;
     }
 
     /**
+     * Validates file permissions for sensitive files
+     * 
+     * @throws Exception if file permissions are too loose
+     */
+    private function validateFilePermissions() {
+        // Check config file permissions
+        $configFile = dirname(__FILE__) . '/config.php';
+        $configPerms = fileperms($configFile) & 0777;
+        if ($configPerms > 0600) {
+            throw new Exception("Config file permissions too loose: {$configPerms}. Should be 600 or less.");
+        }
+
+        // Check log file permissions
+        if (file_exists($this->logFile)) {
+            $logPerms = fileperms($this->logFile) & 0777;
+            if ($logPerms > 0644) {
+                throw new Exception("Log file permissions too loose: {$logPerms}. Should be 644 or less.");
+            }
+        }
+
+        // Ensure script itself has correct permissions
+        $scriptPerms = fileperms(__FILE__) & 0777;
+        if ($scriptPerms > 0755) {
+            throw new Exception("Script file permissions too loose: {$scriptPerms}. Should be 755 or less.");
+        }
+    }
+
+    /**
+     * Implements rate limiting for sync operations
+     * 
+     * @throws Exception if minimum time between syncs hasn't elapsed
+     */
+    private function checkRateLimit() {
+        if (file_exists($this->lastSyncFile)) {
+            $lastSync = (int)file_get_contents($this->lastSyncFile);
+            $timeSinceLastSync = time() - $lastSync;
+            
+            if ($timeSinceLastSync < $this->minSyncInterval) {
+                $waitTime = $this->minSyncInterval - $timeSinceLastSync;
+                throw new Exception(
+                    sprintf(
+                        "Rate limit exceeded. Please wait %d minutes and %d seconds before next sync.",
+                        floor($waitTime / 60),
+                        $waitTime % 60
+                    )
+                );
+            }
+        }
+    }
+
+    /**
+     * Updates the last sync timestamp
+     */
+    private function updateLastSyncTime() {
+        file_put_contents($this->lastSyncFile, time());
+        chmod($this->lastSyncFile, 0600); // Secure the timestamp file
+    }
+
+    /**
      * Main sync method
      * 
      * @param string $direction Format: 'source_to_target' (e.g., 'prod_to_dev', 'stage_to_dev', 'prod_to_stage')
@@ -222,6 +143,9 @@ PHP;
     public function sync($direction = 'prod_to_dev') {
         $this->log("Starting sync: {$direction}");
         try {
+            // Update last sync time at the start
+            $this->updateLastSyncTime();
+            
             // Parse direction
             $parts = explode('_to_', $direction);
             if (count($parts) !== 2) {
@@ -279,6 +203,32 @@ PHP;
     }
 
     /**
+     * Executes a command via SSH on a remote server
+     * 
+     * @param string $environment Environment to connect to
+     * @param string $command Command to execute
+     * @return array Output of the command
+     * @throws Exception on SSH command failure
+     */
+    private function executeSSHCommand($environment, $command) {
+        $sshCmd = sprintf(
+            'ssh -o PasswordAuthentication=no -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p %d %s@%s %s',
+            $this->config[$environment]['ssh_port'],
+            escapeshellarg($this->config[$environment]['ssh_user']),
+            escapeshellarg($this->config[$environment]['ssh_host']),
+            escapeshellarg($command)
+        );
+
+        exec($sshCmd . ' 2>&1', $output, $returnVar);
+
+        if ($returnVar !== 0) {
+            throw new Exception("SSH command failed: " . implode("\n", $output));
+        }
+
+        return $output;
+    }
+
+    /**
      * Creates a backup of the target database
      * 
      * @param string $environment Environment to backup
@@ -289,18 +239,25 @@ PHP;
         $backupFile = dirname(__FILE__) . "/backup_{$environment}_{$timestamp}.sql";
         
         $cmd = sprintf(
-            'mysqldump --opt -h %s -u %s -p%s %s > %s',
+            'mysqldump --opt -h %s -u %s -p%s %s',
             escapeshellarg($this->config[$environment]['db_host']),
             escapeshellarg($this->config[$environment]['db_user']),
             escapeshellarg($this->config[$environment]['db_pass']),
-            escapeshellarg($this->config[$environment]['db_name']),
-            escapeshellarg($backupFile)
+            escapeshellarg($this->config[$environment]['db_name'])
         );
 
-        exec($cmd . ' 2>&1', $output, $returnVar);
-        
-        if ($returnVar !== 0) {
-            throw new Exception("Backup failed: " . implode("\n", $output));
+        if ($environment === 'production' || $environment === 'staging') {
+            // Use SSH to execute the command on remote environments
+            $cmd .= " > {$backupFile}";
+            $this->executeSSHCommand($environment, $cmd);
+        } else {
+            // Execute locally for development
+            $cmd .= " > " . escapeshellarg($backupFile);
+            exec($cmd . ' 2>&1', $output, $returnVar);
+            
+            if ($returnVar !== 0) {
+                throw new Exception("Backup failed: " . implode("\n", $output));
+            }
         }
         
         $this->log("Backup created: {$backupFile}");
@@ -320,17 +277,47 @@ PHP;
                             "." . $table;
         }
 
-        $cmd = sprintf(
-            'ssh -p %d %s@%s "mysqldump --opt --single-transaction -h %s -u %s -p%s %s %s" > temp_dump.sql',
-            $this->config[$environment]['ssh_port'],
-            escapeshellarg($this->config[$environment]['ssh_user']),
-            escapeshellarg($this->config[$environment]['ssh_host']),
-            escapeshellarg($this->config[$environment]['db_host']),
-            escapeshellarg($this->config[$environment]['db_user']),
-            escapeshellarg($this->config[$environment]['db_pass']),
-            escapeshellarg($this->config[$environment]['db_name']),
-            $excludeTables
-        );
+        if ($environment === 'production') {
+            // For production, use SSH to run mysqldump
+            $sshCmd = sprintf(
+                'ssh -p %d %s@%s mysqldump --opt --single-transaction -h %s -u %s -p%s %s %s',
+                $this->config['production']['ssh_port'],
+                escapeshellarg($this->config['production']['ssh_user']),
+                escapeshellarg($this->config['production']['ssh_host']),
+                escapeshellarg($this->config['production']['db_host']),
+                escapeshellarg($this->config['production']['db_user']),
+                escapeshellarg($this->config['production']['db_pass']),
+                escapeshellarg($this->config['production']['db_name']),
+                $excludeTables
+            );
+            
+            $cmd = $sshCmd . ' > temp_dump.sql';
+        } elseif ($environment === 'staging') {
+            // For staging, use SSH to run mysqldump
+            $sshCmd = sprintf(
+                'ssh -p %d %s@%s mysqldump --opt --single-transaction -h %s -u %s -p%s %s %s',
+                $this->config['staging']['ssh_port'],
+                escapeshellarg($this->config['staging']['ssh_user']),
+                escapeshellarg($this->config['staging']['ssh_host']),
+                escapeshellarg($this->config['staging']['db_host']),
+                escapeshellarg($this->config['staging']['db_user']),
+                escapeshellarg($this->config['staging']['db_pass']),
+                escapeshellarg($this->config['staging']['db_name']),
+                $excludeTables
+            );
+            
+            $cmd = $sshCmd . ' > temp_dump.sql';
+        } else {
+            // For development, use local mysqldump
+            $cmd = sprintf(
+                'mysqldump --opt --single-transaction -h %s -u %s -p%s %s %s > temp_dump.sql',
+                escapeshellarg($this->config[$environment]['db_host']),
+                escapeshellarg($this->config[$environment]['db_user']),
+                escapeshellarg($this->config[$environment]['db_pass']),
+                escapeshellarg($this->config[$environment]['db_name']),
+                $excludeTables
+            );
+        }
 
         exec($cmd . ' 2>&1', $output, $returnVar);
         
@@ -347,10 +334,7 @@ PHP;
      */
     private function importDatabase($environment) {
         $cmd = sprintf(
-            'ssh -p %d %s@%s "mysql -h %s -u %s -p%s %s" < temp_dump.sql',
-            $this->config[$environment]['ssh_port'],
-            escapeshellarg($this->config[$environment]['ssh_user']),
-            escapeshellarg($this->config[$environment]['ssh_host']),
+            'mysql -h %s -u %s -p%s %s < temp_dump.sql',
             escapeshellarg($this->config[$environment]['db_host']),
             escapeshellarg($this->config[$environment]['db_user']),
             escapeshellarg($this->config[$environment]['db_pass']),
@@ -453,36 +437,6 @@ PHP;
         $logMessage = "[{$timestamp}] {$message}\n";
         file_put_contents($this->logFile, $logMessage, FILE_APPEND);
         echo $logMessage;
-    }
-
-    /**
-     * Detects database credentials from remote wp-config.php
-     * @param string $environment The environment to detect credentials for
-     */
-    private function detectRemoteCredentials($environment) {
-        $sshCmd = sprintf(
-            'ssh -p %d %s@%s "php -r \\"include(\'%s/wp-config.php\'); echo json_encode([\'DB_HOST\' => DB_HOST, \'DB_NAME\' => DB_NAME, \'DB_USER\' => DB_USER, \'DB_PASSWORD\' => DB_PASSWORD]);\\"" 2>/dev/null',
-            $this->config[$environment]['ssh_port'],
-            escapeshellarg($this->config[$environment]['ssh_user']),
-            escapeshellarg($this->config[$environment]['ssh_host']),
-            escapeshellarg($this->config[$environment]['wp_path'])
-        );
-        
-        exec($sshCmd, $output, $returnVar);
-        
-        if ($returnVar !== 0) {
-            throw new Exception("Failed to detect remote credentials for {$environment}. Ensure SSH key-based authentication is set up.");
-        }
-        
-        $credentials = json_decode($output[0], true);
-        if (!$credentials) {
-            throw new Exception("Failed to parse remote credentials for {$environment}");
-        }
-        
-        $this->config[$environment]['db_host'] = $credentials['DB_HOST'];
-        $this->config[$environment]['db_name'] = $credentials['DB_NAME'];
-        $this->config[$environment]['db_user'] = $credentials['DB_USER'];
-        $this->config[$environment]['db_pass'] = $credentials['DB_PASSWORD'];
     }
 }
 
