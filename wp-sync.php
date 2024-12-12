@@ -15,10 +15,16 @@
  */
 
 class WordPressDatabaseSync {
+    private const YELLOW = "\033[33m";  // Add yellow color for messages
+    private const BLUE = "\033[34m";
+    private const RED = "\033[31m";
+    private const RESET = "\033[0m";
+    
     private $config;
     private $logFile;
     private $lastSyncFile;
-    private $minSyncInterval = 300; // 5 minutes between syncs
+    private $minSyncInterval = 60; // 1 minutes between syncs
+    private $validatedEnvironments = [];  // Track which environments have been validated
     
     private $excludedTables = [
         'wp_users',
@@ -26,11 +32,9 @@ class WordPressDatabaseSync {
     ];
 
     public function __construct() {
-        $this->logFile = dirname(__FILE__) . '/sync_log.txt';
+        $this->logFile = dirname(__FILE__) . '/sync.log';
         $this->lastSyncFile = dirname(__FILE__) . '/.last_sync';
         $this->loadConfig();
-        $this->validateEnvironment();
-        $this->validateFilePermissions();
         $this->checkRateLimit();
     }
 
@@ -40,7 +44,19 @@ class WordPressDatabaseSync {
     private function loadConfig() {
         $configFile = dirname(__FILE__) . '/config.php';
 
-        $this->config = require $configFile;
+        // Debug: Check if file exists
+        if (!file_exists($configFile)) {
+            throw new Exception("Config file not found: {$configFile}");
+        }
+
+        $config = require $configFile;
+        
+        // Debug: Verify config is an array and not being printed
+        if (!is_array($config)) {
+            throw new Exception("Config file must return an array");
+        }
+        
+        $this->config = $config;
         $this->validateConfig();
     }
 
@@ -50,56 +66,14 @@ class WordPressDatabaseSync {
     private function validateConfig() {
         // Validate production config
         $requiredProdKeys = ['ssh_host', 'ssh_user', 'ssh_port', 'db_host', 'db_name', 'db_user', 'db_pass', 'site_url', 'wp_path'];
-        $stages = ['production','staging', 'development'];
-        foreach ($requiredProdKeys as $key) {
-            foreach ($stages as $stage) {   
+        $stages = ['production', 'staging', 'development'];
+        
+        foreach ($stages as $stage) {
+            foreach ($requiredProdKeys as $key) {   
                 if (!isset($this->config[$stage][$key])) {
                     throw new Exception("Missing required {$stage} config key: {$key}");
                 }
             }
-        }
-    }
-
-    /**
-     * Validates the current environment
-     * 
-     * @throws Exception if required commands are not available
-     */
-    private function validateEnvironment() {
-        $requiredCommands = ['mysql', 'mysqldump', 'ssh'];
-        foreach ($requiredCommands as $command) {
-            exec("which {$command}", $output, $returnVar);
-            if ($returnVar !== 0) {
-                throw new Exception("{$command} is not available on this system");
-            }
-        }
-    }
-
-    /**
-     * Validates file permissions for sensitive files
-     * 
-     * @throws Exception if file permissions are too loose
-     */
-    private function validateFilePermissions() {
-        // Check config file permissions
-        $configFile = dirname(__FILE__) . '/config.php';
-        $configPerms = fileperms($configFile) & 0777;
-        if ($configPerms > 0600) {
-            throw new Exception("Config file permissions too loose: {$configPerms}. Should be 600 or less.");
-        }
-
-        // Check log file permissions
-        if (file_exists($this->logFile)) {
-            $logPerms = fileperms($this->logFile) & 0777;
-            if ($logPerms > 0644) {
-                throw new Exception("Log file permissions too loose: {$logPerms}. Should be 644 or less.");
-            }
-        }
-
-        // Ensure script itself has correct permissions
-        $scriptPerms = fileperms(__FILE__) & 0777;
-        if ($scriptPerms > 0755) {
-            throw new Exception("Script file permissions too loose: {$scriptPerms}. Should be 755 or less.");
         }
     }
 
@@ -161,11 +135,11 @@ class WordPressDatabaseSync {
             }
             
             // Create backup of target database
-            $this->createBackup($targetEnv);
+            $backupFile = $this->createBackup($targetEnv);
             
             // Export from source and import to target
-            $this->exportDatabase($sourceEnv);
-            $this->importDatabase($targetEnv);
+            $dumpFile = $this->exportDatabase($sourceEnv);
+            $this->importDatabase($targetEnv, $dumpFile);
             
             // Update URLs in target database
             $this->updateRemoteUrls($targetEnv, $sourceEnv);
@@ -211,21 +185,62 @@ class WordPressDatabaseSync {
      * @throws Exception on SSH command failure
      */
     private function executeSSHCommand($environment, $command) {
+        $this->validateEnvironment($environment);
+        
         $sshCmd = sprintf(
-            'ssh -o PasswordAuthentication=no -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p %d %s@%s %s',
-            $this->config[$environment]['ssh_port'],
+            'ssh -p %s %s@%s %s',
+            escapeshellarg($this->config[$environment]['ssh_port']),
             escapeshellarg($this->config[$environment]['ssh_user']),
             escapeshellarg($this->config[$environment]['ssh_host']),
             escapeshellarg($command)
         );
 
         exec($sshCmd . ' 2>&1', $output, $returnVar);
+        
+        // Log command with its output
+        $this->log(null, "SSH {$environment}: {$command}", !empty($output) ? implode("\n", $output) : null);
 
         if ($returnVar !== 0) {
             throw new Exception("SSH command failed: " . implode("\n", $output));
         }
 
         return $output;
+    }
+
+    /**
+     * Validates the current environment if not already validated in this session
+     * 
+     * @param string $environment The environment to validate
+     * @throws Exception if required commands are not available
+     */
+    private function validateEnvironment($environment) {
+        // Skip validation if already done for this environment
+        if (isset($this->validatedEnvironments[$environment])) {
+            return;
+        }
+        
+        $this->log("Validating environment on {$environment} server...");
+        
+        // Build validation command
+        $validationCmd = 'which mysql mysqldump php sed grep';
+        
+        $sshConfig = $this->config[$environment];
+        $sshCmd = sprintf(
+            'ssh -p %s %s@%s %s',
+            escapeshellarg($sshConfig['ssh_port']),
+            escapeshellarg($sshConfig['ssh_user']),
+            escapeshellarg($sshConfig['ssh_host']),
+            escapeshellarg($validationCmd)
+        );
+        
+        exec($sshCmd . ' 2>&1', $output, $returnVar);
+        if ($returnVar !== 0) {
+            throw new Exception("Connection failed or required commands not available on {$environment} server");
+        }
+        
+        // Mark this environment as validated
+        $this->validatedEnvironments[$environment] = true;
+        $this->log("Environment validation successful on {$environment} server");
     }
 
     /**
@@ -236,31 +251,51 @@ class WordPressDatabaseSync {
      */
     private function createBackup($environment) {
         $timestamp = date('Y-m-d_H-i-s');
-        $backupFile = dirname(__FILE__) . "/backup_{$environment}_{$timestamp}.sql";
+        $backupDir = $this->config[$environment]['wp_path'];
+        $backupFile = "backup_{$environment}_{$timestamp}.sql";
         
-        $cmd = sprintf(
+        // Log initial parameters
+        $this->log("Starting backup for environment: {$environment}");
+        $this->log("Backup directory: {$backupDir}");
+        $this->log("Backup filename: {$backupFile}");
+
+        // Check if backup directory exists
+        $checkDirCmd = sprintf("[ -d %s ] && echo 'Directory exists' || echo 'Directory does not exist'", 
+            escapeshellarg($backupDir)
+        );
+        $this->log("Checking directory existence...");
+        $this->executeSSHCommand($environment, $checkDirCmd);
+
+        // Get current working directory before operations
+        $this->log("Checking current working directory...");
+        $this->executeSSHCommand($environment, 'pwd');
+        
+        // Create dump command and log it
+        $dumpCmd = sprintf(
             'mysqldump --opt -h %s -u %s -p%s %s',
             escapeshellarg($this->config[$environment]['db_host']),
             escapeshellarg($this->config[$environment]['db_user']),
             escapeshellarg($this->config[$environment]['db_pass']),
             escapeshellarg($this->config[$environment]['db_name'])
         );
-
-        if ($environment === 'production' || $environment === 'staging') {
-            // Use SSH to execute the command on remote environments
-            $cmd .= " > {$backupFile}";
-            $this->executeSSHCommand($environment, $cmd);
-        } else {
-            // Execute locally for development
-            $cmd .= " > " . escapeshellarg($backupFile);
-            exec($cmd . ' 2>&1', $output, $returnVar);
-            
-            if ($returnVar !== 0) {
-                throw new Exception("Backup failed: " . implode("\n", $output));
-            }
-        }
         
-        $this->log("Backup created: {$backupFile}");
+        $cdCmd = sprintf(
+            'cd %s && pwd',
+            escapeshellarg($this->config[$environment]['wp_path'])
+        );
+
+        // Combine commands for the final execution
+        $fullCmd = sprintf('%s && %s > %s', 
+            $cdCmd,
+            $dumpCmd, 
+            escapeshellarg($backupFile)
+        );
+        $this->executeSSHCommand($environment, $fullCmd);
+        
+        $this->executeSSHCommand($environment, sprintf('ls -l %s', escapeshellarg("{$backupDir}/{$backupFile}")));
+        
+        $this->log("Backup created: {$backupDir}/{$backupFile}");
+        return "{$backupDir}/{$backupFile}";
     }
 
     /**
@@ -268,81 +303,81 @@ class WordPressDatabaseSync {
      * 
      * @param string $environment Source environment
      * @throws Exception on export failure
+     * @return string Path to the exported dump file
      */
     private function exportDatabase($environment) {
-        $excludeTables = '';
-        foreach ($this->excludedTables as $table) {
-            $excludeTables .= " --ignore-table=" . 
-                            $this->config[$environment]['db_name'] . 
-                            "." . $table;
-        }
+        // Generate exclude tables argument
+        $excludeTables = array_map(function($table) use ($environment) {
+            return sprintf("--ignore-table=%s.%s", 
+                $this->config[$environment]['db_name'], 
+                $table
+            );
+        }, $this->excludedTables);
+        $excludeTablesStr = implode(' ', $excludeTables);
 
-        if ($environment === 'production') {
-            // For production, use SSH to run mysqldump
-            $sshCmd = sprintf(
-                'ssh -p %d %s@%s mysqldump --opt --single-transaction -h %s -u %s -p%s %s %s',
-                $this->config['production']['ssh_port'],
-                escapeshellarg($this->config['production']['ssh_user']),
-                escapeshellarg($this->config['production']['ssh_host']),
-                escapeshellarg($this->config['production']['db_host']),
-                escapeshellarg($this->config['production']['db_user']),
-                escapeshellarg($this->config['production']['db_pass']),
-                escapeshellarg($this->config['production']['db_name']),
-                $excludeTables
-            );
+        // Prepare mysqldump command with all necessary options
+        $dumpCmd = sprintf(
+            'mysqldump --opt --single-transaction -h %s -u %s -p%s %s %s',
+            escapeshellarg($this->config[$environment]['db_host']),
+            escapeshellarg($this->config[$environment]['db_user']),
+            escapeshellarg($this->config[$environment]['db_pass']),
+            escapeshellarg($this->config[$environment]['db_name']),
+            $excludeTablesStr
+        );
+
+        // Determine output filename
+        $timestamp = date('Y-m-d_H-i-s');
+        $dumpFile = "temp_export_{$environment}_{$timestamp}.sql";
+
+        // Prepare full command with output redirection
+        $fullCmd = "{$dumpCmd} > {$dumpFile}";
+
+        // If the environment has SSH configuration, use SSH to execute
+        if (isset($this->config[$environment]['ssh_host'])) {
+            // For remote environments, verify file existence via SSH
+            $fullCmd = "{$dumpCmd} > {$dumpFile} && ls -l {$dumpFile}";
+            $output = $this->executeSSHCommand($environment, $fullCmd);
             
-            $cmd = $sshCmd . ' > temp_dump.sql';
-        } elseif ($environment === 'staging') {
-            // For staging, use SSH to run mysqldump
-            $sshCmd = sprintf(
-                'ssh -p %d %s@%s mysqldump --opt --single-transaction -h %s -u %s -p%s %s %s',
-                $this->config['staging']['ssh_port'],
-                escapeshellarg($this->config['staging']['ssh_user']),
-                escapeshellarg($this->config['staging']['ssh_host']),
-                escapeshellarg($this->config['staging']['db_host']),
-                escapeshellarg($this->config['staging']['db_user']),
-                escapeshellarg($this->config['staging']['db_pass']),
-                escapeshellarg($this->config['staging']['db_name']),
-                $excludeTables
-            );
-            
-            $cmd = $sshCmd . ' > temp_dump.sql';
+            // If no exception was thrown, the file was created
+            $this->log("Database export successful on remote server: {$dumpFile}");
         } else {
-            // For development, use local mysqldump
-            $cmd = sprintf(
-                'mysqldump --opt --single-transaction -h %s -u %s -p%s %s %s > temp_dump.sql',
-                escapeshellarg($this->config[$environment]['db_host']),
-                escapeshellarg($this->config[$environment]['db_user']),
-                escapeshellarg($this->config[$environment]['db_pass']),
-                escapeshellarg($this->config[$environment]['db_name']),
-                $excludeTables
-            );
+            // Local execution
+            exec($fullCmd . ' 2>&1', $output, $returnVar);
+            
+            if ($returnVar !== 0) {
+                throw new Exception("Export failed: " . implode("\n", $output));
+            }
+
+            // Verify local file exists
+            if (!file_exists($dumpFile)) {
+                throw new Exception("Export file {$dumpFile} was not created");
+            }
+
+            $this->log("Database export successful locally: {$dumpFile}");
         }
 
-        exec($cmd . ' 2>&1', $output, $returnVar);
-        
-        if ($returnVar !== 0) {
-            throw new Exception("Export failed: " . implode("\n", $output));
-        }
+        return $dumpFile;
     }
 
     /**
      * Imports database to target environment
      * 
      * @param string $environment Target environment
+     * @param string $dumpFile Path to the dump file
      * @throws Exception on import failure
      */
-    private function importDatabase($environment) {
+    private function importDatabase($environment, $dumpFile) {
         $cmd = sprintf(
-            'mysql -h %s -u %s -p%s %s < temp_dump.sql',
+            'mysql -h %s -u %s -p%s %s < %s',
             escapeshellarg($this->config[$environment]['db_host']),
             escapeshellarg($this->config[$environment]['db_user']),
             escapeshellarg($this->config[$environment]['db_pass']),
-            escapeshellarg($this->config[$environment]['db_name'])
+            escapeshellarg($this->config[$environment]['db_name']),
+            escapeshellarg($dumpFile)
         );
 
         exec($cmd . ' 2>&1', $output, $returnVar);
-        
+       
         if ($returnVar !== 0) {
             throw new Exception("Import failed: " . implode("\n", $output));
         }
@@ -419,7 +454,7 @@ class WordPressDatabaseSync {
      * Cleans up temporary files
      */
     private function cleanup() {
-        $tmpFiles = ['temp_dump.sql'];
+        $tmpFiles = ['temp_dump.sql', 'temp_export_production.sql', 'temp_export_staging.sql', 'temp_export_development.sql'];
         foreach ($tmpFiles as $file) {
             if (file_exists($file)) {
                 unlink($file);
@@ -428,25 +463,50 @@ class WordPressDatabaseSync {
     }
 
     /**
-     * Logs a message with timestamp
+     * Logs a message with timestamp and optional command output
      * 
      * @param string $message Message to log
+     * @param string|null $command Optional command that was executed
+     * @param string|null $output Optional output from command
      */
-    private function log($message) {
+    private function log($message, $command = null, $output = null) {
+        if ($command !== null) {
+            $command = preg_replace("/-p['\"](.*?)['\"]/", "-p'****'", $command);
+        }
         $timestamp = date('Y-m-d H:i:s');
-        $logMessage = "[{$timestamp}] {$message}\n";
+        
+        // Format for file logging (without colors)
+        $logMessage = "[{$timestamp}] ";
+        if ($command !== null) {
+            $logMessage .= "Command: {$command}" . ($output ? " | Output: {$output}" : "") . "\n";
+        } else {
+            $logMessage .= "{$message}\n";
+        }
         file_put_contents($this->logFile, $logMessage, FILE_APPEND);
-        echo $logMessage;
+        
+        // Format for terminal output (with colors)
+        if ($command !== null) {
+            // Command mode: Blue command + Red output
+            echo "[{$timestamp}] " . self::BLUE . $command . self::RESET;
+        
+                echo " | " . self::RED . $output . self::RESET;
+            }
+            if ($output) {
+                echo "\n"; 
+            } else if ($message !== null) {
+                // Message mode: Yellow text
+                echo "[{$timestamp}] " . self::YELLOW . $message . self::RESET . "\n";
+            }
+        }
     }
-}
 
-// Script execution
-try {
-    $sync = new WordPressDatabaseSync();
-    $direction = isset($argv[1]) ? $argv[1] : 'prod_to_dev';
-    $sync->sync($direction);
-    echo "Sync completed successfully\n";
-} catch (Exception $e) {
-    echo "Error: " . $e->getMessage() . "\n";
-    exit(1);
+    // Script execution
+    try {
+        $sync = new WordPressDatabaseSync();
+        $direction = isset($argv[1]) ? $argv[1] : 'prod_to_dev';
+        $sync->sync($direction);
+        echo "Sync completed successfully\n";
+    } catch (Exception $e) {
+        echo "Error: " . $e->getMessage() . "\n";
+        exit(1);
 }
